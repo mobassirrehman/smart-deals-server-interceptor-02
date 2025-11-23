@@ -13,13 +13,8 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-//middleware config
 app.use(cors());
 app.use(express.json());
-
-const logger = (req, res, next) => {
-  next();
-};
 
 const verifyFirebaseToken = async (req, res, next) => {
   const authorization = req.headers.authorization;
@@ -37,26 +32,6 @@ const verifyFirebaseToken = async (req, res, next) => {
   } catch {
     return res.status(401).send({ message: "unauthorized access" });
   }
-};
-
-const verifyJWTToken = (req, res, next) => {
-  console.log("in middleware", req.headers);
-  const authorization = req.headers.authorization;
-  if (!authorization) {
-    return res.status(401).send({ message: "unauthorized access" });
-  }
-  const token = authorization.split(" ")[1];
-  if (!token) {
-    return res.status(401).send({ message: "unauthorized access" });
-  }
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(401).send({ message: "unauthorized access" });
-    }
-    req.decoded = decoded;
-    next();
-  });
 };
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.0zmmwcn.mongodb.net/?appName=Cluster0`;
@@ -81,23 +56,18 @@ async function run() {
     const bidsCollection = db.collection("bids");
     const usersCollection = db.collection("user");
 
-    //jwt related APIs
     app.post("/getToken", (req, res) => {
       const loggedUser = req.body;
       const token = jwt.sign(
         { email: loggedUser.email },
         process.env.JWT_SECRET,
-        {
-          expiresIn: "1h",
-        }
+        { expiresIn: "1h" }
       );
       res.send({ token });
     });
 
-    //Users API
     app.post("/users", async (req, res) => {
       const newUser = req.body;
-
       const email = req.body.email;
       const query = { email: email };
       const existingUser = await usersCollection.findOne(query);
@@ -109,23 +79,22 @@ async function run() {
       }
     });
 
-    //Prodcuts API
     app.get("/products", async (req, res) => {
-      //   const projectsFields = { title: 1, image: 1 };
-
       const email = req.query.email;
       const query = {};
+
       if (email) {
-        query.buyer_email = email;
+        query.email = email;
       }
-      const cursor = productsCollection.find(query);
+
+      const cursor = productsCollection.find(query).sort({ created_at: -1 });
       const result = await cursor.toArray();
       res.send(result);
     });
 
     app.get("/latest-products", async (req, res) => {
       const cursor = productsCollection
-        .find()
+        .find({ status: "pending" })
         .sort({ created_at: -1 })
         .limit(5);
       const result = await cursor.toArray();
@@ -139,53 +108,116 @@ async function run() {
       }
       const query = { _id: new ObjectId(id) };
       const result = await productsCollection.findOne(query);
+
+      if (!result) {
+        return res.status(404).send({ message: "Product not found" });
+      }
+
       res.send(result);
     });
 
     app.post("/products", verifyFirebaseToken, async (req, res) => {
       const newProduct = req.body;
+
+      if (req.token_email !== newProduct.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
       const result = await productsCollection.insertOne(newProduct);
       res.send(result);
     });
 
-    app.patch("/products/:id", async (req, res) => {
+    app.put("/products/:id", verifyFirebaseToken, async (req, res) => {
       const id = req.params.id;
+
       if (!ObjectId.isValid(id)) {
         return res.status(400).send({ message: "Invalid product ID" });
       }
+
       const updatedProduct = req.body;
       const query = { _id: new ObjectId(id) };
-      const update = {
-        $set: {
-          name: updatedProduct.name,
-          price: updatedProduct.price,
-        },
-      };
+
+      const existingProduct = await productsCollection.findOne(query);
+      if (!existingProduct) {
+        return res.status(404).send({ message: "Product not found" });
+      }
+
+      if (existingProduct.email !== req.token_email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
+      delete updatedProduct._id;
+      delete updatedProduct.email;
+      delete updatedProduct.created_at;
+
+      const update = { $set: updatedProduct };
+      const result = await productsCollection.updateOne(query, update);
+      res.send(result);
+    });
+
+    app.patch("/products/status/:id", verifyFirebaseToken, async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid product ID" });
+      }
+
+      if (!status || !["pending", "sold"].includes(status)) {
+        return res.status(400).send({ message: "Invalid status" });
+      }
+
+      const query = { _id: new ObjectId(id) };
+      const existingProduct = await productsCollection.findOne(query);
+
+      if (!existingProduct) {
+        return res.status(404).send({ message: "Product not found" });
+      }
+
+      if (existingProduct.email !== req.token_email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
+      const update = { $set: { status } };
       const result = await productsCollection.updateOne(query, update);
       res.send(result);
     });
 
     app.delete("/products/:id", verifyFirebaseToken, async (req, res) => {
       const id = req.params.id;
+
       if (!ObjectId.isValid(id)) {
         return res.status(400).send({ message: "Invalid product ID" });
       }
+
       const query = { _id: new ObjectId(id) };
+      const existingProduct = await productsCollection.findOne(query);
+
+      if (!existingProduct) {
+        return res.status(404).send({ message: "Product not found" });
+      }
+
+      if (existingProduct.email !== req.token_email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
+      await bidsCollection.deleteMany({ product: id });
       const result = await productsCollection.deleteOne(query);
       res.send(result);
     });
 
-    // bids related APIs
     app.get("/bids", verifyFirebaseToken, async (req, res) => {
       const email = req.query.email;
       const query = {};
+
       if (email) {
         query.buyer_email = email;
         if (email !== req.token_email) {
           return res.status(403).send({ message: "forbidden access" });
         }
       }
-      const cursor = bidsCollection.find(query);
+
+      const cursor = bidsCollection.find(query).sort({ bid_price: -1 });
       const result = await cursor.toArray();
       res.send(result);
     });
@@ -204,24 +236,140 @@ async function run() {
 
     app.post("/bids", verifyFirebaseToken, async (req, res) => {
       const newBid = req.body;
+
+      if (req.token_email !== newBid.buyer_email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
+      const product = await productsCollection.findOne({
+        _id: new ObjectId(newBid.product),
+      });
+
+      if (!product) {
+        return res.status(404).send({ message: "Product not found" });
+      }
+
+      if (product.status === "sold") {
+        return res.status(400).send({ message: "Product is already sold" });
+      }
+
+      if (product.email === req.token_email) {
+        return res
+          .status(400)
+          .send({ message: "Cannot bid on your own product" });
+      }
+
       const result = await bidsCollection.insertOne(newBid);
       res.send(result);
     });
 
+    app.patch("/bids/status/:id", verifyFirebaseToken, async (req, res) => {
+      const bidId = req.params.id;
+      const { status } = req.body;
+
+      if (!ObjectId.isValid(bidId)) {
+        return res.status(400).send({ message: "Invalid bid ID" });
+      }
+
+      if (!status || !["pending", "confirmed", "rejected"].includes(status)) {
+        return res.status(400).send({ message: "Invalid status" });
+      }
+
+      const bid = await bidsCollection.findOne({ _id: new ObjectId(bidId) });
+      if (!bid) {
+        return res.status(404).send({ message: "Bid not found" });
+      }
+
+      const product = await productsCollection.findOne({
+        _id: new ObjectId(bid.product),
+      });
+
+      if (!product) {
+        return res.status(404).send({ message: "Product not found" });
+      }
+
+      if (product.email !== req.token_email) {
+        return res
+          .status(403)
+          .send({ message: "Only product owner can update bid status" });
+      }
+
+      if (status === "confirmed") {
+        await bidsCollection.updateOne(
+          { _id: new ObjectId(bidId) },
+          { $set: { status: "confirmed" } }
+        );
+
+        await productsCollection.updateOne(
+          { _id: new ObjectId(bid.product) },
+          { $set: { status: "sold" } }
+        );
+
+        await bidsCollection.deleteMany({
+          product: bid.product,
+          _id: { $ne: new ObjectId(bidId) },
+        });
+
+        res.send({
+          message: "Bid confirmed, product marked as sold",
+          modifiedCount: 1,
+        });
+      } else {
+        const result = await bidsCollection.updateOne(
+          { _id: new ObjectId(bidId) },
+          { $set: { status } }
+        );
+        res.send(result);
+      }
+    });
+
     app.delete("/bids/:id", verifyFirebaseToken, async (req, res) => {
       const id = req.params.id;
+
       if (!ObjectId.isValid(id)) {
         return res.status(400).send({ message: "Invalid bid ID" });
       }
+
       const query = { _id: new ObjectId(id) };
+      const existingBid = await bidsCollection.findOne(query);
+
+      if (!existingBid) {
+        return res.status(404).send({ message: "Bid not found" });
+      }
+
+      if (existingBid.buyer_email !== req.token_email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
       const result = await bidsCollection.deleteOne(query);
       res.send(result);
     });
 
-    await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
+    app.delete(
+      "/bids/product/:productId",
+      verifyFirebaseToken,
+      async (req, res) => {
+        const productId = req.params.productId;
+
+        const product = await productsCollection.findOne({
+          _id: new ObjectId(productId),
+        });
+
+        if (!product) {
+          return res.status(404).send({ message: "Product not found" });
+        }
+
+        if (product.email !== req.token_email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
+
+        const result = await bidsCollection.deleteMany({ product: productId });
+        res.send(result);
+      }
     );
+
+    await client.db("admin").command({ ping: 1 });
+    console.log("Connected to MongoDB!");
   } catch (error) {
     console.error("MongoDB connection error:", error);
   }
@@ -229,5 +377,5 @@ async function run() {
 run().catch(console.dir);
 
 app.listen(port, () => {
-  console.log(`Smart server is running on port ${port}`);
+  console.log(`Smart server running on port ${port}`);
 });
